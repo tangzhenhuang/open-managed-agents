@@ -12,8 +12,6 @@ import (
 	"time"
 )
 
-const tunnelsBeta = "mcp-tunnels-2026-05-19"
-
 type parsedCertificate struct {
 	Fingerprint string
 	ExpiresAt   *time.Time
@@ -63,15 +61,4 @@ func parseCACertificatePEM(raw string) (parsedCertificate, error) {
 	sum := sha256.Sum256(cert.Raw)
 	expiresAt := cert.NotAfter.UTC()
 	return parsedCertificate{Fingerprint: hex.EncodeToString(sum[:]), ExpiresAt: &expiresAt}, nil
-}
-
-func hasTunnelsBetaValues(values []string) bool {
-	for _, value := range values {
-		for _, part := range strings.Split(value, ",") {
-			if strings.TrimSpace(part) == tunnelsBeta {
-				return true
-			}
-		}
-	}
-	return false
 }

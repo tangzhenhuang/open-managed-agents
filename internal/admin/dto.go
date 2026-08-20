@@ -57,10 +57,6 @@ type updateExternalKeyRequest struct {
 	Geo            *string         `json:"geo"`
 }
 
-type rotateTunnelTokenRequest struct {
-	Reason string `json:"reason"`
-}
-
 type createTunnelCertificateRequest struct {
 	CACertificatePEM string `json:"ca_certificate_pem"`
 }

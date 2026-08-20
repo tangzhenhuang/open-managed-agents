@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/superduck-ai/open-managed-agents/internal/modelmapping"
 )
@@ -77,10 +78,33 @@ func validate(cfg Config) error {
 	if err := validatePositiveValues(cfg); err != nil {
 		return err
 	}
+	if err := validateTunnelDomainSuffix(cfg.Tunnel.DomainSuffix); err != nil {
+		return err
+	}
 	if err := validateVaultMasterKey(cfg.Vault); err != nil {
 		return err
 	}
 	return validateCodeSessionUpstreamProxyMITMConfig(cfg.CodeSession)
+}
+
+func validateTunnelDomainSuffix(value string) error {
+	if value == "" {
+		return errors.New("tunnel.domain_suffix is required")
+	}
+	if value != strings.ToLower(value) || strings.TrimSpace(value) != value || len(value) > 253 {
+		return errors.New("tunnel.domain_suffix must be a lowercase DNS name")
+	}
+	for _, label := range strings.Split(value, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return errors.New("tunnel.domain_suffix must be a lowercase DNS name")
+		}
+		for _, char := range label {
+			if (char < 'a' || char > 'z') && (char < '0' || char > '9') && char != '-' {
+				return errors.New("tunnel.domain_suffix must be a lowercase DNS name")
+			}
+		}
+	}
+	return nil
 }
 
 func (m MasterKeyConfig) inlineKEKSet() bool {
@@ -153,6 +177,15 @@ func validatePositiveValues(cfg Config) error {
 	}{
 		{name: "storage.max_file_bytes", valid: cfg.Storage.MaxFileBytes > 0},
 		{name: "storage.workspace_limit_bytes", valid: cfg.Storage.WorkspaceLimitBytes > 0},
+		{name: "tunnel.poll_timeout", valid: cfg.Tunnel.PollTimeout > 0 && cfg.Tunnel.PollTimeout <= 30*time.Second},
+		{name: "tunnel.request_timeout", valid: cfg.Tunnel.RequestTimeout >= time.Second && cfg.Tunnel.RequestTimeout <= 10*time.Minute},
+		{name: "tunnel.presence_ttl", valid: cfg.Tunnel.PresenceTTL > 0},
+		{name: "tunnel.tombstone_ttl", valid: cfg.Tunnel.TombstoneTTL > 0},
+		{name: "tunnel.max_pending_requests", valid: cfg.Tunnel.MaxPendingRequests > 0},
+		{name: "tunnel.max_pending_bytes", valid: cfg.Tunnel.MaxPendingBytes > 0},
+		{name: "tunnel.max_body_bytes", valid: cfg.Tunnel.MaxBodyBytes > 0},
+		{name: "tunnel.max_header_bytes", valid: cfg.Tunnel.MaxHeaderBytes > 0},
+		{name: "tunnel.max_header_value_bytes", valid: cfg.Tunnel.MaxHeaderValueBytes > 0},
 		{name: "batch.worker_concurrency", valid: cfg.Batch.WorkerConcurrency > 0},
 		{name: "batch.max_requests", valid: cfg.Batch.MaxRequests > 0},
 		{name: "batch.max_body_bytes", valid: cfg.Batch.MaxBodyBytes > 0},

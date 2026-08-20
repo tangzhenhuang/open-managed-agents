@@ -74,6 +74,15 @@ func (h *Handler) handleMCPProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	request := r.Clone(r.Context())
 	request.Header = headers
+	if h.tunnelInvoker != nil && h.tunnelInvoker.ServeTunnel(
+		w,
+		request,
+		claims.OrganizationUUID,
+		claims.WorkspaceUUID,
+		target,
+	) {
+		return
+	}
 	h.serveMCPProxy(w, request, target, codeSessionID)
 }
 

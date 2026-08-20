@@ -34,6 +34,7 @@ import (
 	sessionsapi "github.com/superduck-ai/open-managed-agents/internal/sessions"
 	skillsapi "github.com/superduck-ai/open-managed-agents/internal/skills"
 	"github.com/superduck-ai/open-managed-agents/internal/storage"
+	tunnelsapi "github.com/superduck-ai/open-managed-agents/internal/tunnels"
 	vaultsapi "github.com/superduck-ai/open-managed-agents/internal/vaults"
 	webhooksapi "github.com/superduck-ai/open-managed-agents/internal/webhooks"
 	workbenchapi "github.com/superduck-ai/open-managed-agents/internal/workbench"
@@ -53,6 +54,7 @@ type Server struct {
 	agents               *agents.Handler
 	batch                *batches.Handler
 	codeSessions         *codesessions.Handler
+	connector            *tunnelsapi.ConnectorHandler
 	deployments          *deploymentsapi.Handler
 	deploymentRuns       *deploymentsapi.RunsHandler
 	envs                 *environments.Handler
@@ -63,6 +65,8 @@ type Server struct {
 	models               *modelsapi.Handler
 	sessions             *sessionsapi.Handler
 	skills               *skillsapi.Handler
+	tunnels              *tunnelsapi.Handler
+	tunnelIngress        *tunnelsapi.IngressHandler
 	vaults               *vaultsapi.Handler
 	webhooks             *webhooksapi.Handler
 }
@@ -83,6 +87,7 @@ type ServerDeps struct {
 	FilestoreService       *filestoreapi.Service
 	VaultSecrets           *secrets.Service
 	SessionEventBus        sessionfanout.EventBus
+	TunnelBroker           *tunnelsapi.Broker
 }
 
 // NewServer 用显式依赖组装 HTTP API Server。
@@ -132,6 +137,15 @@ func NewServer(deps ServerDeps) *Server {
 		vaults:               vaultsapi.NewHandler(deps.Config, deps.DB, deps.VaultSecrets, webhookEnqueuer, componentLogger("vaults")),
 		webhooks:             webhooksapi.NewHandler(deps.Config.Webhook, deps.DB, webhookLogger),
 	}
+	if deps.DB != nil {
+		tunnelService := tunnelsapi.NewService(deps.Config.Tunnel, deps.DB, deps.VaultSecrets).WithBroker(deps.TunnelBroker)
+		s.tunnels = tunnelsapi.NewHandler(tunnelService, componentLogger("tunnels"))
+	}
+	if deps.DB != nil && deps.TunnelBroker != nil {
+		s.connector = tunnelsapi.NewConnectorHandler(deps.Config.Tunnel, deps.DB, deps.TunnelBroker, componentLogger("tunnel_connector"))
+		s.tunnelIngress = tunnelsapi.NewIngressHandler(deps.Config.Tunnel, deps.DB, deps.TunnelBroker, componentLogger("tunnel_ingress"))
+		s.codeSessions.WithTunnelInvoker(s.tunnelIngress)
+	}
 	router := chi.NewRouter()
 	router.Use(s.requestIDMiddleware)
 	router.Use(requestLoggingMiddleware(componentLogger("http")))
@@ -141,6 +155,9 @@ func NewServer(deps ServerDeps) *Server {
 	router.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		httpapi.WriteJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
+	if s.connector != nil {
+		router.Mount("/connector", s.connector)
+	}
 	s.registerVersionedAPIRoutes(router)
 	s.registerPlatformConsoleRoutes(router, workbenchLogger, mcpCatalogHandler)
 	s.router = router
@@ -242,12 +259,18 @@ func (s *Server) registerAuthenticatedV1Routes(r chi.Router) {
 	r.Mount("/environments", s.envs)
 	r.Mount("/files", s.files)
 	r.Mount("/memory_stores", s.memory)
+	if s.tunnelIngress != nil {
+		r.Mount("/mcp", s.tunnelIngress)
+	}
 	r.Post("/messages", s.messages.Create)
 	r.Mount("/messages/batches", s.batch)
 	r.Mount("/models", s.models)
 	r.Mount("/organizations", s.admin)
 	r.Mount("/sessions", s.sessions)
 	r.Mount("/skills", s.skills)
+	if s.tunnels != nil {
+		r.Mount("/tunnels", s.tunnels)
+	}
 	r.Mount("/vaults", s.vaults)
 	r.Mount("/webhooks", s.webhooks)
 }
