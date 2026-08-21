@@ -28,6 +28,7 @@ const (
 
 type Handler struct {
 	service      *Service
+	logger       *slog.Logger
 	errorAdapter *httpapi.ErrorAdapter
 	router       chi.Router
 }
@@ -39,6 +40,7 @@ func NewHandler(service *Service, logger *slog.Logger) *Handler {
 	logger = logging.LoggerOrDefault(logger)
 	handler := &Handler{
 		service:      service,
+		logger:       logger,
 		errorAdapter: httpapi.NewErrorAdapter(logger),
 	}
 	router := chi.NewRouter()
@@ -96,6 +98,7 @@ func (h *Handler) createTunnel(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	h.logManagementSuccess(r, "mcp tunnel created", tunnel.ExternalID)
 	httpapi.WriteJSON(w, http.StatusOK, responseFromTunnel(tunnel))
 	return nil
 }
@@ -158,6 +161,7 @@ func (h *Handler) archiveTunnel(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	h.logManagementSuccess(r, "mcp tunnel archived", tunnel.ExternalID)
 	httpapi.WriteJSON(w, http.StatusOK, responseFromTunnel(tunnel))
 	return nil
 }
@@ -194,6 +198,7 @@ func (h *Handler) rotateTunnelToken(w http.ResponseWriter, r *http.Request) erro
 		return err
 	}
 	defer clear(plaintext)
+	h.logManagementSuccess(r, "mcp tunnel token rotated", chi.URLParam(r, "tunnel_id"))
 	w.Header().Set("Cache-Control", "no-store")
 	httpapi.WriteJSON(w, http.StatusOK, tokenResponse(token, plaintext))
 	return nil

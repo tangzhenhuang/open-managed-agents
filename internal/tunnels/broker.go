@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"time"
 
@@ -36,6 +37,29 @@ type Broker struct {
 	now    func() time.Time
 }
 
+type ConnectorSnapshot struct {
+	State         string                     `json:"state"`
+	InstanceCount int                        `json:"instance_count"`
+	Channels      []ConnectorChannelSnapshot `json:"channels"`
+}
+
+type ConnectorChannelSnapshot struct {
+	Name            string `json:"name"`
+	ProcessAffinity bool   `json:"process_affinity"`
+	InstanceCount   int    `json:"instance_count"`
+}
+
+type connectorSnapshotCommands struct {
+	channels *redis.StringSliceCmd
+	metadata *redis.MapStringStringCmd
+}
+
+type connectorPresenceCommand struct {
+	tunnelUUID string
+	channel    string
+	members    *redis.StringSliceCmd
+}
+
 type responseWaiter struct {
 	broker     *Broker
 	pubsub     *redis.PubSub
@@ -49,6 +73,93 @@ func NewBroker(client *redis.Client, cfg config.TunnelConfig) *Broker {
 		panic("tunnels: redis client is required")
 	}
 	return &Broker{client: client, cfg: cfg, now: func() time.Time { return time.Now().UTC() }}
+}
+
+func (b *Broker) ConnectorSnapshot(ctx context.Context, tunnelUUID string) (ConnectorSnapshot, error) {
+	snapshots, err := b.ConnectorSnapshots(ctx, []string{tunnelUUID})
+	if err != nil {
+		return ConnectorSnapshot{}, err
+	}
+	return snapshots[tunnelUUID], nil
+}
+
+func (b *Broker) ConnectorSnapshots(ctx context.Context, tunnelUUIDs []string) (map[string]ConnectorSnapshot, error) {
+	snapshots := make(map[string]ConnectorSnapshot, len(tunnelUUIDs))
+	if len(tunnelUUIDs) == 0 {
+		return snapshots, nil
+	}
+	metadataPipeline := b.client.Pipeline()
+	commands := make(map[string]connectorSnapshotCommands, len(tunnelUUIDs))
+	for _, tunnelUUID := range tunnelUUIDs {
+		commands[tunnelUUID] = connectorSnapshotCommands{
+			channels: metadataPipeline.SMembers(ctx, b.channelsKey(tunnelUUID)),
+			metadata: metadataPipeline.HGetAll(ctx, b.channelMetadataKey(tunnelUUID)),
+		}
+	}
+	if _, err := metadataPipeline.Exec(ctx); err != nil {
+		return nil, fmt.Errorf("read tunnel connector metadata: %w", err)
+	}
+
+	now := strconv.FormatInt(b.now().UnixMilli(), 10)
+	presencePipeline := b.client.Pipeline()
+	presenceCommands := make([]connectorPresenceCommand, 0)
+	channelMetadata := make(map[string]map[string]string, len(tunnelUUIDs))
+	for _, tunnelUUID := range tunnelUUIDs {
+		channelNames, err := commands[tunnelUUID].channels.Result()
+		if err != nil {
+			return nil, fmt.Errorf("read tunnel connector channels: %w", err)
+		}
+		metadata, err := commands[tunnelUUID].metadata.Result()
+		if err != nil {
+			return nil, fmt.Errorf("read tunnel connector channel metadata: %w", err)
+		}
+		sort.Strings(channelNames)
+		channelMetadata[tunnelUUID] = metadata
+		for _, channel := range channelNames {
+			key := b.presenceKey(tunnelUUID, channel)
+			presencePipeline.ZRemRangeByScore(ctx, key, "-inf", now)
+			presenceCommands = append(presenceCommands, connectorPresenceCommand{
+				tunnelUUID: tunnelUUID,
+				channel:    channel,
+				members:    presencePipeline.ZRange(ctx, key, 0, -1),
+			})
+		}
+	}
+	if len(presenceCommands) > 0 {
+		if _, err := presencePipeline.Exec(ctx); err != nil {
+			return nil, fmt.Errorf("read tunnel connector presence: %w", err)
+		}
+	}
+
+	instances := make(map[string]map[string]struct{}, len(tunnelUUIDs))
+	for _, tunnelUUID := range tunnelUUIDs {
+		snapshots[tunnelUUID] = ConnectorSnapshot{State: "disconnected", Channels: []ConnectorChannelSnapshot{}}
+		instances[tunnelUUID] = make(map[string]struct{})
+	}
+	for _, command := range presenceCommands {
+		members, err := command.members.Result()
+		if err != nil {
+			return nil, fmt.Errorf("read tunnel connector instances: %w", err)
+		}
+		for _, instanceID := range members {
+			instances[command.tunnelUUID][instanceID] = struct{}{}
+		}
+		processAffinity, _ := strconv.ParseBool(channelMetadata[command.tunnelUUID][command.channel])
+		snapshot := snapshots[command.tunnelUUID]
+		snapshot.Channels = append(snapshot.Channels, ConnectorChannelSnapshot{
+			Name: command.channel, ProcessAffinity: processAffinity, InstanceCount: len(members),
+		})
+		snapshots[command.tunnelUUID] = snapshot
+	}
+	for _, tunnelUUID := range tunnelUUIDs {
+		snapshot := snapshots[tunnelUUID]
+		snapshot.InstanceCount = len(instances[tunnelUUID])
+		if snapshot.InstanceCount > 0 {
+			snapshot.State = "connected"
+		}
+		snapshots[tunnelUUID] = snapshot
+	}
+	return snapshots, nil
 }
 
 func (b *Broker) RegisterConnector(ctx context.Context, tunnelUUID, instanceID string, tokenVersion int64, channels []ChannelDeclaration) error {

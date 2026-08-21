@@ -55,6 +55,7 @@ type Server struct {
 	batch                *batches.Handler
 	codeSessions         *codesessions.Handler
 	connector            *tunnelsapi.ConnectorHandler
+	consoleTunnels       *tunnelsapi.ConsoleHandler
 	deployments          *deploymentsapi.Handler
 	deploymentRuns       *deploymentsapi.RunsHandler
 	envs                 *environments.Handler
@@ -140,6 +141,18 @@ func NewServer(deps ServerDeps) *Server {
 	if deps.DB != nil {
 		tunnelService := tunnelsapi.NewService(deps.Config.Tunnel, deps.DB, deps.VaultSecrets).WithBroker(deps.TunnelBroker)
 		s.tunnels = tunnelsapi.NewHandler(tunnelService, componentLogger("tunnels"))
+		s.consoleTunnels = tunnelsapi.NewConsoleHandler(
+			tunnelService,
+			deps.TunnelBroker,
+			func(w http.ResponseWriter, r *http.Request) (tunnelsapi.ConsoleScope, bool) {
+				scope, ok := platformapi.ResolveConsoleWorkspaceRequest(w, r, deps.DB)
+				return tunnelsapi.ConsoleScope{
+					OrganizationUUID: scope.OrganizationUUID,
+					WorkspaceUUID:    scope.WorkspaceUUID,
+				}, ok
+			},
+			componentLogger("console_mcp_tunnels"),
+		)
 	}
 	if deps.DB != nil && deps.TunnelBroker != nil {
 		s.connector = tunnelsapi.NewConnectorHandler(deps.Config.Tunnel, deps.DB, deps.TunnelBroker, componentLogger("tunnel_connector"))
@@ -243,6 +256,9 @@ func (s *Server) registerPlatformConsoleRoutes(router chi.Router, workbenchLogge
 			platformapi.RegisterConsoleOrganizationMemberRoutes(r, s.db)
 			platformapi.RegisterConsoleOrganizationInviteRoutes(r, s.db)
 			mcpCatalogHandler.RegisterRoutes(r)
+			if s.consoleTunnels != nil {
+				r.Mount("/workspaces/{workspaceId}/mcp_tunnels", s.consoleTunnels)
+			}
 		})
 		r.Route("/api/{orgUuid}", func(r chi.Router) {
 			s.files.RegisterPlatformRoutes(r)

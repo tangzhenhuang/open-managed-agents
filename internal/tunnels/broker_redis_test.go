@@ -6,14 +6,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os/exec"
 	"strconv"
 	"testing"
 	"time"
 
 	"github.com/superduck-ai/open-managed-agents/internal/config"
+	"github.com/superduck-ai/open-managed-agents/internal/db"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -210,6 +214,64 @@ func TestBrokerSubscriptionBeforeEnqueuePreservesFastNotification(t *testing.T) 
 	}
 	if response.ResponseType != ResponseTypeJSONRPC {
 		t.Fatalf("terminal response = %+v", response)
+	}
+}
+
+func TestBrokerConnectorSnapshotsTrackChannelsInstancesAndExpiry(t *testing.T) {
+	client := startTestRedis(t)
+	clock := time.Date(2026, time.August, 21, 1, 0, 0, 0, time.UTC)
+	broker := NewBroker(client, config.TunnelConfig{PresenceTTL: time.Minute})
+	broker.now = func() time.Time { return clock }
+	ctx := context.Background()
+	tunnelUUID := "44444444-4444-4444-8444-444444444444"
+	channels := []ChannelDeclaration{{Name: "main", ProcessAffinity: true}, {Name: "aux"}}
+	if err := broker.ensureActiveTokenVersion(ctx, tunnelUUID, 1); err != nil {
+		t.Fatalf("ensureActiveTokenVersion: %v", err)
+	}
+	for _, instanceID := range []string{"instance-a", "instance-b"} {
+		if err := broker.RegisterConnector(ctx, tunnelUUID, instanceID, 1, channels); err != nil {
+			t.Fatalf("RegisterConnector(%s): %v", instanceID, err)
+		}
+	}
+
+	snapshot, err := broker.ConnectorSnapshot(ctx, tunnelUUID)
+	if err != nil {
+		t.Fatalf("ConnectorSnapshot: %v", err)
+	}
+	if snapshot.State != "connected" || snapshot.InstanceCount != 2 || len(snapshot.Channels) != 2 {
+		t.Fatalf("connected snapshot = %+v", snapshot)
+	}
+	if snapshot.Channels[0].Name != "aux" || snapshot.Channels[0].ProcessAffinity || snapshot.Channels[0].InstanceCount != 2 {
+		t.Fatalf("aux snapshot = %+v", snapshot.Channels[0])
+	}
+	if snapshot.Channels[1].Name != "main" || !snapshot.Channels[1].ProcessAffinity || snapshot.Channels[1].InstanceCount != 2 {
+		t.Fatalf("main snapshot = %+v", snapshot.Channels[1])
+	}
+
+	clock = clock.Add(2 * time.Minute)
+	snapshot, err = broker.ConnectorSnapshot(ctx, tunnelUUID)
+	if err != nil {
+		t.Fatalf("ConnectorSnapshot expired: %v", err)
+	}
+	if snapshot.State != "disconnected" || snapshot.InstanceCount != 0 {
+		t.Fatalf("expired snapshot = %+v", snapshot)
+	}
+}
+
+func TestConsoleConnectorSnapshotsDegradeRedisFailureToUnknown(t *testing.T) {
+	client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+	if err := client.Close(); err != nil {
+		t.Fatalf("close redis client: %v", err)
+	}
+	handler := &ConsoleHandler{
+		broker: NewBroker(client, config.TunnelConfig{PresenceTTL: time.Minute}),
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	records := []db.MCPTunnel{{UUID: "55555555-5555-4555-8555-555555555555"}}
+	snapshots := handler.connectorSnapshots(httptest.NewRequest(http.MethodGet, "/", nil), records)
+	snapshot := snapshots[records[0].UUID]
+	if snapshot.State != "unknown" || snapshot.InstanceCount != 0 || len(snapshot.Channels) != 0 {
+		t.Fatalf("degraded snapshot = %+v, want unknown", snapshot)
 	}
 }
 

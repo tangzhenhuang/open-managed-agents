@@ -47,7 +47,9 @@ describe('ConsoleShell', () => {
     );
     expect(screen.queryByRole('link', { name: /Playground/i })).toBeNull();
     expect(screen.queryByRole('link', { name: /Dreams/i })).toBeNull();
-    expect(screen.queryByRole('link', { name: /MCP tunnels/i })).toBeNull();
+    expect(screen.getByRole('link', { name: /MCP tunnels/i }).getAttribute('href')).toBe(
+      '/workspaces/default/mcp-tunnels',
+    );
     expect(screen.queryByRole('link', { name: 'Tags' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Feedback' })).toBeNull();
   });

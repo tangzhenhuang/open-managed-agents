@@ -88,6 +88,7 @@ export const consoleNavigation: NavItem[] = [
       { href: '/environments', label: 'Environments', labelId: 'nav.environments' },
       { href: '/credential-vaults', label: 'Credential vaults', labelId: 'nav.credentialVaults' },
       { href: '/memory-stores', label: 'Memory stores', labelId: 'nav.memoryStores' },
+      { href: '/mcp-tunnels', label: 'MCP tunnels', labelId: 'nav.mcpTunnels' },
     ],
   },
   {

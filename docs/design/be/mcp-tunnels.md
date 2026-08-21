@@ -28,9 +28,12 @@ Connector wire 兼容 OpenAI `tunnel-client` 的 poll/response 合同。OMA fork
 ```mermaid
 flowchart LR
     SDK[Claude SDK / CLI] -->|workspace API key| Management[Tunnel Management]
+    Web[OMA Console] -->|cookie Session + CSRF| ConsoleAPI[Console Tunnel API]
     Caller[Direct MCP caller] -->|X-Api-Key| Ingress[MCP Ingress]
     Agent[Managed Agent] -. in-process TunnelInvoker .-> Ingress
     Management --> DB[(PostgreSQL)]
+    ConsoleAPI --> DB
+    ConsoleAPI --> Broker
     Management --> Secrets[Envelope encryption]
     Ingress --> Broker[Redis Broker]
     Connector[tunnel-client] -->|Bearer tunnel token| ConnectorAPI[Connector API]
@@ -39,7 +42,7 @@ flowchart LR
     Connector --> PrivateMCP[Private MCP Server]
 ```
 
-`internal/api` 只挂载路由和注入依赖。`internal/tunnels` 持有管理面、Connector API、MCP Ingress、
+`internal/api` 只挂载路由和注入依赖。`internal/tunnels` 持有 Claude 兼容管理面、Console 管理面、Connector API、MCP Ingress、
 协议类型、错误合同与 Broker。`internal/db` 继续作为唯一 SQL 边界。Code Session 在消费方 package
 定义 `TunnelInvoker` 接口，生产组装传入 Tunnel DataPlane，避免进程内 HTTP 回环。
 
@@ -51,17 +54,29 @@ flowchart LR
 | 边界 | 路由 | 凭据 | 授权范围 |
 | --- | --- | --- | --- |
 | 管理面 | `/v1/tunnels...` | `X-Api-Key` 或 Bearer workspace API key | Principal 的 organization + workspace |
+| Console 管理面 | `/api/console/organizations/{orgUuid}/workspaces/{workspaceId}/mcp_tunnels...` | 平台 cookie Session；写请求携带现有 `X-CSRF-Token` | 可见 organization + 归属该 organization 的 workspace |
 | MCP Ingress | `/v1/mcp/{tunnel_id}[/{channel}]` | 只读取 `X-Api-Key` | Principal 的 organization + workspace |
-| Connector | `/connector/v1/tunnels/{tunnel_id}/poll`、`response` | Bearer tunnel token | token 所属 tunnel |
+| Connector metadata | `GET /connector/v1/tunnels/{tunnel_id}` | Bearer tunnel token | token 所属 tunnel |
+| Connector 数据面 | `/connector/v1/tunnels/{tunnel_id}/poll`、`response` | Bearer tunnel token | token 所属 tunnel |
 | Agent 进程内调用 | `TunnelInvoker` | 已验证的 session ingress JWT 与 URL policy | session 的 organization + workspace |
 
-管理面不增加 tunnel-specific RBAC。任意 active workspace API key 可以管理所属 workspace 的 Tunnel。
+两个管理面都不增加 tunnel-specific RBAC。`/v1` 继续使用 active workspace API key；Console API 复用
+`platformAuthMiddleware`、organization 可见性和 Console workspace scope 解析，不引入第二套鉴权授权。
+组织不匹配、workspace 不属于当前组织、或 Tunnel 不属于请求 scope 时统一按不可见资源处理。
 所有 PostgreSQL 查询和写入都必须同时绑定 `organization_uuid`、`workspace_uuid` 和 Tunnel 标识。
 `rotate_token` 接受 Claude SDK/CLI 的可选 `reason` 字段；在项目建立统一的管理面审计事件框架前，
 服务端不持久化也不记录该字段，避免形成 Tunnel 独有且难以演进的审计模型。
 
 MCP Ingress 不消费 `Authorization`；它仅用 `X-Api-Key` 完成 OMA 鉴权，并把允许的
 `Authorization` 作为下游 MCP 凭据。Tunnel token 永远不被 MCP Ingress 接受。
+
+Console 列表返回基础 Tunnel 字段、canonical `mcp_url` 和连接快照，不返回 token。plaintext token 只由
+`reveal_token` 与 `rotate_token` 响应返回，并使用 `Cache-Control: no-store`。Console 错误使用现有扁平
+`{error, message}` 风格，不要求 `anthropic-beta` header。
+
+Connector metadata 与 poll 使用同一 Bearer tunnel token 校验：错误 token、retired token、归档 token
+或归档 Tunnel 均拒绝。metadata 返回 `{id, name, description}`；`name` 优先使用 `display_name`，为空时
+回退 Tunnel ID，当前 `description` 固定为空字符串，不增加持久化字段。
 
 ## 持久化模型
 
@@ -117,6 +132,16 @@ Redis 使用 Sorted Set 保存 channel queue、request state 保存持久终态�
 在请求清理和 claim 时批量移除过期 owner，避免未显式 DELETE 的历史 MCP session 造成无界增长。
 key 使用 `{tunnel_uuid}` hash tag，保证同一 Tunnel 的多键脚本兼容 Redis Cluster。
 
+## 实时连接快照
+
+Console 列表从 Redis presence 构造只读快照。读取时先删除每个 channel 已过期的 presence，再按
+instance ID 去重：至少一个 live instance 时为 `connected`，没有 live instance 时为 `disconnected`。
+快照返回 channel 名称、`process_affinity`、每个 channel 的 instance 数量和 Tunnel 级去重 instance
+总数，不返回 instance ID。
+
+Redis 不可用时，Console API 仍返回 Tunnel 资源，仅将连接状态降级为 `unknown` 并记录安全的结构化
+告警；连接状态读取不得阻塞创建、reveal、rotate 或 archive。
+
 ## Channel、长轮询与超时
 
 - channel 匹配 `[a-z0-9_-]{1,64}`，每个 Tunnel 最多 32 个；
@@ -150,8 +175,15 @@ deadline 到期返回 504。Redis 故障时不回退到进程内队列。
 
 运行日志禁止记录 API key、tunnel token、下游 Authorization、Cookie、shard token 和原始 body。
 
+创建、轮换和归档成功事件复用 `slog`、HTTP request ID 和现有 access log，记录 organization、workspace、
+Tunnel 与 actor 的安全标识。rotate 的 `reason` 不持久化也不记录。本阶段不新增 Tunnel 专属 metrics、
+审计表或事件模型；这些结构化日志用于运维追踪，不宣称为合规审计。
+
 ## 验收
 
-实现至少覆盖：Claude SDK 管理面契约、workspace 越权、token rotate 与在途 drain、Redis 并发 claim、
-重复/错误 shard response、取消与过期、header 清理、Connector notification/terminal wire、无 Connector
-快速失败，以及 OMA fork `tunnel-client` 到私网 MCP Server 的端到端调用。
+实现至少覆盖：Claude SDK 管理面契约、Console Session 与 organization/workspace 越权、Connector metadata、
+token rotate 与在途 drain、Redis 并发 claim、presence 快照与故障降级、重复/错误 shard response、取消与
+过期、header 清理、Connector notification/terminal wire、无 Connector 快速失败，以及 Web 创建、reveal、
+轮换、归档与可见性轮询。
+
+OMA 与 `tunnel-client` 的跨仓核心链路 E2E 在本阶段明确延后；功能稳定后再单独建设与执行。

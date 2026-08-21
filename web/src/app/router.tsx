@@ -5,6 +5,7 @@ import { DashboardPage } from '../features/dashboard/DashboardPage';
 import { CachingPage, CostPage, LogsPage, RateLimitsPage, UsagePage } from '../features/analytics/AnalyticsPages';
 import { LoginPage } from '../features/auth/LoginPage';
 import { ManagedAgentsPage } from '../features/managed-agents/ManagedAgentsPage';
+import { McpTunnelsPage } from '../features/mcp-tunnels/McpTunnelsPage';
 import { OrganizationSettingsPage } from '../features/settings/OrganizationSettingsPage';
 import { WorkspaceApiKeysPage } from '../features/settings/WorkspaceApiKeysPage';
 import { WorkspaceWebhooksPage } from '../features/settings/WorkspaceWebhooksPage';
@@ -393,7 +394,13 @@ const webhooksRoute = createRoute({
 const mcpTunnelsRoute = createRoute({
   getParentRoute: () => consoleRoute,
   path: 'mcp-tunnels',
-  component: () => <DashboardPage section="mcp-tunnels" />,
+  component: McpTunnelsPage,
+});
+
+const workspaceMcpTunnelsRoute = createRoute({
+  getParentRoute: () => consoleRoute,
+  path: 'workspaces/$workspaceId/mcp-tunnels',
+  component: McpTunnelsPage,
 });
 
 const tagsRoute = createRoute({
@@ -507,6 +514,7 @@ const routeTree = rootRoute.addChildren([
       securityRoute,
       webhooksRoute,
       mcpTunnelsRoute,
+      workspaceMcpTunnelsRoute,
       tagsRoute,
       settingsWorkspaceKeysRoute,
       settingsWorkspaceWebhooksRoute,

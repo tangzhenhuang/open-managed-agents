@@ -811,6 +811,117 @@ func TestPlatformConsoleBackendMigratedRoutes(t *testing.T) {
 		}
 	})
 
+	t.Run("console workspace mcp tunnel lifecycle and scope", func(t *testing.T) {
+		path := consoleOrgPath + "/workspaces/default/mcp_tunnels"
+		unauthorizedResp := app.platformRequest(t, http.MethodGet, path, nil, nil)
+		defer unauthorizedResp.Body.Close()
+		if unauthorizedResp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("unauthorized tunnel list status = %d, want 401: %s", unauthorizedResp.StatusCode, readAll(t, unauthorizedResp.Body))
+		}
+
+		otherOrgResp := app.platformRequest(t, http.MethodGet, "/api/console/organizations/"+otherOrgUUID+"/workspaces/default/mcp_tunnels", nil, cookies)
+		defer otherOrgResp.Body.Close()
+		if otherOrgResp.StatusCode != http.StatusNotFound {
+			t.Fatalf("other organization tunnel list status = %d, want 404: %s", otherOrgResp.StatusCode, readAll(t, otherOrgResp.Body))
+		}
+
+		missingWorkspaceResp := app.platformRequest(t, http.MethodGet, consoleOrgPath+"/workspaces/wrkspc_missing/mcp_tunnels", nil, cookies)
+		defer missingWorkspaceResp.Body.Close()
+		if missingWorkspaceResp.StatusCode != http.StatusNotFound {
+			t.Fatalf("missing workspace tunnel list status = %d, want 404: %s", missingWorkspaceResp.StatusCode, readAll(t, missingWorkspaceResp.Body))
+		}
+
+		createResp := app.platformRequest(t, http.MethodPost, path, strings.NewReader(`{"display_name":" Console tools "}`), cookies)
+		defer createResp.Body.Close()
+		if createResp.StatusCode != http.StatusOK {
+			t.Fatalf("create tunnel status = %d, want 200: %s", createResp.StatusCode, readAll(t, createResp.Body))
+		}
+		var created map[string]any
+		decodeJSON(t, createResp.Body, &created)
+		tunnelID := stringValue(created["id"])
+		if !strings.HasPrefix(tunnelID, "tnl_") || created["type"] != "tunnel" || created["display_name"] != "Console tools" {
+			t.Fatalf("created tunnel = %#v, want normalized tunnel resource", created)
+		}
+		if created["tunnel_token"] != nil || !strings.HasSuffix(stringValue(created["mcp_url"]), "/v1/mcp/"+tunnelID) {
+			t.Fatalf("created tunnel = %#v, want canonical URL without token", created)
+		}
+		connection, ok := created["connection"].(map[string]any)
+		if !ok || connection["state"] != "disconnected" {
+			t.Fatalf("created tunnel connection = %#v, want disconnected", created["connection"])
+		}
+
+		listResp := app.platformRequest(t, http.MethodGet, path, nil, cookies)
+		defer listResp.Body.Close()
+		if listResp.StatusCode != http.StatusOK {
+			t.Fatalf("list tunnels status = %d, want 200: %s", listResp.StatusCode, readAll(t, listResp.Body))
+		}
+		var listed []map[string]any
+		decodeJSON(t, listResp.Body, &listed)
+		if !containsConsoleTunnel(listed, tunnelID, false) {
+			t.Fatalf("listed tunnels = %#v, want active tunnel %s", listed, tunnelID)
+		}
+		listedConnection, _ := listed[0]["connection"].(map[string]any)
+		if listedConnection["state"] != "unknown" {
+			t.Fatalf("listed tunnel connection = %#v, want unknown without broker", listedConnection)
+		}
+		if strings.Contains(fmt.Sprint(listed), "tunnel_token") {
+			t.Fatalf("listed tunnels contain token field: %#v", listed)
+		}
+
+		revealResp := app.platformRequest(t, http.MethodPost, path+"/"+tunnelID+"/reveal_token", nil, cookies)
+		defer revealResp.Body.Close()
+		if revealResp.StatusCode != http.StatusOK || revealResp.Header.Get("Cache-Control") != "no-store" {
+			t.Fatalf("reveal token status = %d cache-control = %q, want 200/no-store: %s", revealResp.StatusCode, revealResp.Header.Get("Cache-Control"), readAll(t, revealResp.Body))
+		}
+		var revealed map[string]any
+		decodeJSON(t, revealResp.Body, &revealed)
+		initialToken := stringValue(revealed["tunnel_token"])
+		if initialToken == "" {
+			t.Fatalf("revealed token = %#v, want plaintext token", revealed)
+		}
+
+		rotateResp := app.platformRequest(t, http.MethodPost, path+"/"+tunnelID+"/rotate_token", strings.NewReader(`{}`), cookies)
+		defer rotateResp.Body.Close()
+		if rotateResp.StatusCode != http.StatusOK || rotateResp.Header.Get("Cache-Control") != "no-store" {
+			t.Fatalf("rotate token status = %d cache-control = %q, want 200/no-store: %s", rotateResp.StatusCode, rotateResp.Header.Get("Cache-Control"), readAll(t, rotateResp.Body))
+		}
+		var rotated map[string]any
+		decodeJSON(t, rotateResp.Body, &rotated)
+		if rotatedToken := stringValue(rotated["tunnel_token"]); rotatedToken == "" || rotatedToken == initialToken {
+			t.Fatalf("rotated token = %#v, want new plaintext token", rotated)
+		}
+
+		archiveResp := app.platformRequest(t, http.MethodPost, path+"/"+tunnelID+"/archive", nil, cookies)
+		defer archiveResp.Body.Close()
+		if archiveResp.StatusCode != http.StatusOK {
+			t.Fatalf("archive tunnel status = %d, want 200: %s", archiveResp.StatusCode, readAll(t, archiveResp.Body))
+		}
+		var archived map[string]any
+		decodeJSON(t, archiveResp.Body, &archived)
+		if archived["archived_at"] == nil {
+			t.Fatalf("archived tunnel = %#v, want archived_at", archived)
+		}
+
+		activeResp := app.platformRequest(t, http.MethodGet, path, nil, cookies)
+		defer activeResp.Body.Close()
+		var active []map[string]any
+		decodeJSON(t, activeResp.Body, &active)
+		if containsConsoleTunnel(active, tunnelID, true) {
+			t.Fatalf("active tunnels = %#v, archived tunnel must be hidden", active)
+		}
+
+		archivedListResp := app.platformRequest(t, http.MethodGet, path+"?include_archived=true", nil, cookies)
+		defer archivedListResp.Body.Close()
+		if archivedListResp.StatusCode != http.StatusOK {
+			t.Fatalf("archived tunnel list status = %d, want 200: %s", archivedListResp.StatusCode, readAll(t, archivedListResp.Body))
+		}
+		var archivedList []map[string]any
+		decodeJSON(t, archivedListResp.Body, &archivedList)
+		if !containsConsoleTunnel(archivedList, tunnelID, true) {
+			t.Fatalf("archived tunnels = %#v, want tunnel %s", archivedList, tunnelID)
+		}
+	})
+
 	t.Run("success console workspace create route", func(t *testing.T) {
 		path := consoleOrgPath + "/workspaces"
 		workspaceName := fmt.Sprintf("Docs %d", time.Now().UnixNano())
@@ -902,6 +1013,16 @@ func containsConsoleAPIKeyStatus(keys []map[string]any, keyID string, status str
 		if key["id"] == keyID && key["status"] == status {
 			return true
 		}
+	}
+	return false
+}
+
+func containsConsoleTunnel(tunnels []map[string]any, tunnelID string, archived bool) bool {
+	for _, tunnel := range tunnels {
+		if tunnel["id"] != tunnelID {
+			continue
+		}
+		return (tunnel["archived_at"] != nil) == archived
 	}
 	return false
 }

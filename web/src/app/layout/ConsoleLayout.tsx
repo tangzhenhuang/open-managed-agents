@@ -827,6 +827,7 @@ const managedAgentPathByHref: Record<string, string> = {
   '/environments': 'environments',
   '/credential-vaults': 'vaults',
   '/memory-stores': 'memory-stores',
+  '/mcp-tunnels': 'mcp-tunnels',
   '/dreams': 'dreams',
 };
 
@@ -887,7 +888,7 @@ async function navigateToMatchingWorkspacePath(currentPath: string, workspaceId:
     .replace(/^\/settings\/workspaces\/[^/]+\/webhooks/, workspaceWebhooksPath(workspaceId))
     .replace(/^\/workspaces\/[^/]+\/(playground|files|skills|batches)/, `/workspaces/${encodedWorkspaceId}/$1`)
     .replace(
-      /^\/workspaces\/[^/]+\/(agent-quickstart|agents|sessions|deployments|environments|vaults|memory-stores|dreams)/,
+      /^\/workspaces\/[^/]+\/(agent-quickstart|agents|sessions|deployments|environments|vaults|memory-stores|mcp-tunnels|dreams)/,
       `/workspaces/${encodedWorkspaceId}/$1`,
     );
 

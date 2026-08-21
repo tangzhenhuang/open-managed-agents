@@ -1,6 +1,7 @@
 package tunnels
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -32,15 +33,29 @@ const (
 
 type ConnectorHandler struct {
 	cfg          config.TunnelConfig
-	db           *db.DB
+	db           connectorDatabase
 	broker       *Broker
 	errorAdapter *httpapi.ErrorAdapter
 	router       chi.Router
 }
 
+type connectorDatabase interface {
+	FindMCPTunnelTokenContext(context.Context, string, []byte) (db.MCPTunnelTokenContext, error)
+	GetMCPTunnel(context.Context, string, string, string) (db.MCPTunnel, error)
+}
+
 type connectorAuthContext struct {
-	TunnelUUID   string
-	TokenVersion int64
+	TunnelUUID       string
+	TunnelExternalID string
+	OrganizationUUID string
+	WorkspaceUUID    string
+	TokenVersion     int64
+}
+
+type connectorTunnelMetadata struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
 }
 
 type polledCommandEnvelope struct {
@@ -61,6 +76,7 @@ func NewConnectorHandler(cfg config.TunnelConfig, database *db.DB, broker *Broke
 	router.NotFound(wrap(handler.connectorNotFound))
 	router.MethodNotAllowed(wrap(handler.connectorNotFound))
 	router.Route("/v1/tunnels/{tunnel_id}", func(r chi.Router) {
+		r.Get("/", wrap(handler.metadata))
 		r.Get("/poll", wrap(handler.poll))
 		r.Post("/response", wrap(handler.postResponse))
 	})
@@ -74,6 +90,33 @@ func (h *ConnectorHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (h *ConnectorHandler) connectorNotFound(http.ResponseWriter, *http.Request) error {
 	return routeNotFound()
+}
+
+func (h *ConnectorHandler) metadata(w http.ResponseWriter, r *http.Request) error {
+	credential, err := h.authenticate(r, false)
+	if err != nil {
+		return err
+	}
+	tunnel, err := h.db.GetMCPTunnel(
+		r.Context(), credential.OrganizationUUID, credential.WorkspaceUUID, credential.TunnelExternalID,
+	)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			return invalidConnectorCredential()
+		}
+		return internalError("Could not load tunnel metadata", fmt.Errorf("load tunnel metadata: %w", err))
+	}
+	if tunnel.ArchivedAt != nil {
+		return invalidConnectorCredential()
+	}
+	name := tunnel.ExternalID
+	if tunnel.DisplayName != nil && *tunnel.DisplayName != "" {
+		name = *tunnel.DisplayName
+	}
+	httpapi.WriteJSON(w, http.StatusOK, connectorTunnelMetadata{
+		ID: tunnel.ExternalID, Name: name, Description: "",
+	})
+	return nil
 }
 
 func (h *ConnectorHandler) poll(w http.ResponseWriter, r *http.Request) error {
@@ -173,7 +216,11 @@ func (h *ConnectorHandler) authenticate(r *http.Request, allowRetired bool) (con
 	if context.TunnelArchivedAt != nil || context.Token.ArchivedAt != nil || (!allowRetired && context.Token.RetiredAt != nil) {
 		return connectorAuthContext{}, invalidConnectorCredential()
 	}
-	return connectorAuthContext{TunnelUUID: context.Token.TunnelUUID, TokenVersion: context.Token.Version}, nil
+	return connectorAuthContext{
+		TunnelUUID: context.Token.TunnelUUID, TunnelExternalID: context.TunnelExternalID,
+		OrganizationUUID: context.OrganizationUUID, WorkspaceUUID: context.WorkspaceUUID,
+		TokenVersion: context.Token.Version,
+	}, nil
 }
 
 func (h *ConnectorHandler) pollOptions(r *http.Request) (int, time.Duration, error) {
